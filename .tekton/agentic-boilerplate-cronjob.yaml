@@ -1,0 +1,131 @@
+# CronJob to run Claude Code CLI nightly to execute boilerplate updates.
+# Clones the repo, runs `make boilerplate-update boilerplate-commit` via Claude Code,
+# and opens a PR if changes are detected.
+# Requires agentic-boilerplate-rbac.yaml to be applied first.
+# Requires Secrets: bedrock-creds, agentic-boilerplate-github-secret
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: agentic-boilerplate-update
+  namespace: ocm-container-tenant
+spec:
+  schedule: "36 21 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 1800
+      backoffLimit: 0
+      template:
+        spec:
+          containers:
+            - name: agentic-boilerplate
+              image: quay.io/redhat-services-prod/openshift/boilerplate:image-v8.4.1
+              command:
+                - /bin/bash
+                - -c
+              args:
+                - |
+                  set -euo pipefail
+
+                  echo "[INFO] === Agentic Boilerplate Update Starting ==="
+                  echo "[INFO] Date: $(date -u)"
+
+                  # Install Claude Code CLI
+                  echo "[INFO] Installing Claude Code CLI..."
+                  curl -fsSL https://claude.ai/install.sh | bash
+                  export PATH="$HOME/.local/bin:$PATH"
+                  echo "[INFO] Claude Code CLI version: $(claude --version)"
+
+                  # Configure git authentication
+                  echo "[INFO] Configuring git..."
+                  git config --global user.name "agentic-boilerplate-bot"
+                  git config --global user.email "noreply@redhat.com"
+                  git config --global credential.helper store
+                  echo "https://x-access-token:${GITHUB_TOKEN}@github.com" > ~/.git-credentials
+
+                  # Clone from the fork (where we have push access)
+                  WORK_DIR=$(mktemp -d)
+                  FORK_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${FORK_ORG}/${REPO_NAME}.git"
+                  echo "[INFO] Cloning ${FORK_ORG}/${REPO_NAME}..."
+                  git clone "${FORK_URL}" "${WORK_DIR}/repo"
+                  cd "${WORK_DIR}/repo"
+
+                  # Add upstream remote and sync fork to upstream master
+                  git remote add upstream "https://github.com/${UPSTREAM_ORG}/${REPO_NAME}.git"
+                  git fetch upstream master
+                  git reset --hard upstream/master
+
+                  # Run Claude Code for the full workflow
+                  echo "[INFO] Running Claude Code..."
+
+                  CLAUDE_EXIT=0
+                  claude -p "You are running inside a CI cronjob. Perform the following steps:
+
+                  1. Run 'make boilerplate-update boilerplate-commit'. If something fails, investigate and fix it, then retry.
+                     The BOILERPLATE_GIT_REPO environment variable is already set to use HTTPS.
+                     Do not modify any files outside the boilerplate/ directory unless necessary to fix a build issue.
+
+                  2. If boilerplate-commit created a new branch with changes, push it to origin (the fork at ${FORK_ORG}/${REPO_NAME}).
+
+                  3. Then create a cross-fork PR to the upstream repo using:
+                     gh pr create --repo ${UPSTREAM_ORG}/${REPO_NAME} --head ${FORK_ORG}:<branch-name> --base master
+
+                  4. If there are already open boilerplate PRs (check with gh pr list --repo ${UPSTREAM_ORG}/${REPO_NAME} --search 'Boilerplate: in:title' --state open), skip creating a new one.
+
+                  5. If boilerplate is already up-to-date and there are no changes, that is a success -- just report that no update was needed." \
+                    --allowedTools "Bash" \
+                    --dangerously-skip-permissions \
+                    --max-turns 25 \
+                    --output-format text || CLAUDE_EXIT=$?
+
+                  if [[ ${CLAUDE_EXIT} -ne 0 ]]; then
+                    echo "[ERROR] Claude Code exited with status ${CLAUDE_EXIT}"
+                    exit 1
+                  fi
+
+                  echo "[INFO] === Agentic Boilerplate Update Complete ==="
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: CLAUDE_CODE_USE_BEDROCK
+                  value: "1"
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: bedrock-creds
+                      key: AWS_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: bedrock-creds
+                      key: AWS_SECRET_ACCESS_KEY
+                - name: AWS_DEFAULT_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: bedrock-creds
+                      key: AWS_DEFAULT_REGION
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: agentic-boilerplate-github-secret
+                      key: GITHUB_TOKEN
+                - name: UPSTREAM_ORG
+                  value: "openshift"
+                - name: FORK_ORG
+                  value: "tnierman"
+                - name: REPO_NAME
+                  value: "ocm-container"
+                - name: BOILERPLATE_GIT_REPO
+                  value: "https://github.com/openshift/boilerplate.git"
+              resources:
+                requests:
+                  cpu: 500m
+                  memory: 512Mi
+                limits:
+                  cpu: "2"
+                  memory: 2Gi
+          serviceAccountName: agentic-boilerplate-ocm-container
+          restartPolicy: Never
