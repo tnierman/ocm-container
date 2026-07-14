@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# OCM_CONTAINER_DOC: Run through the 'Cluster Has Gone Missing' process
 
 # Checks AWS cloudtrail logs for node shutdown events associated with a specific cluster_has_gone_missing (CHGM) alert,
 # and prompts to post a CHGM message to service log and silence the PD alert.
@@ -106,7 +107,7 @@ then
   # If FORCE is not TRUE, then prompt for confirmation
   if [[ ${FORCE} != 'TRUE' ]]
   then
-    read -p 'Post a CHGM Servicelog and silence the alert? (Y/n)' -n 1 -r
+    read -p 'Post a CHGM Servicelog and silence the alert? (Y/n) ' -n 1 -r
     echo ''
     if [[ ! $REPLY =~ ^[Yy]$ ]]
     then
@@ -116,7 +117,7 @@ then
 fi
 
 pd incident:ack -i ${PD_ALERT}
-osdctl servicelog post -t ${SL_URL} -p CLUSTER_UUID=${CLUSTER_UUID}
+osdctl servicelog post ${CLUSTER_UUID} -y -t ${SL_URL}
 pd incident:notes -i ${PD_ALERT} -n "$PD_CHGM_NOTE"
 pd incident:assign -i ${PD_ALERT} -u $PD_SILENT_TEST_USER
 pd incident:merge -i ${PD_ALERT} -I ${CHGM_PARENT_INCIDENT}
