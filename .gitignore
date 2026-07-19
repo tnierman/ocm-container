@@ -1,1 +1,35 @@
+# IDE configs
+.vscode/*
+
+# cp/mv backups
+*~
+
+# Build and goreleaser output dirs
+dist/
+build/
+
 env.source
+.github/*
+
+# Swapfiles
+*.swp
+
+# Logs
+*.log
+debug.*
+
+# IDE config dirs
+.vscode
+
+# Certs
+*crt
+*cert
+*key
+*csr
+*pem
+
+# Transitional development
+env.source.sample.old
+init.sh.old
+ocm-container.sh.old
+build.sh.old

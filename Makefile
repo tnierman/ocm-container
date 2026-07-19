@@ -1,7 +1,422 @@
-.PHONY: init
-init:
-	bash init.sh
+PROJECT_NAME := ocm-container
+PROJECT_SUMMARY := 'Containerized environment for accessing OpenShift v4 clusters, packing necessary tools and utilities'
 
-.PHONY: build
-build:
-	bash build.sh
+# Go binary detection
+GO_BIN := $(shell command -v go 2>/dev/null)
+ifeq ($(GO_BIN),)
+$(error ERROR: go binary not found. Ensure go is installed and run make again)
+endif
+
+# Container engine detection
+CONTAINER_ENGINE := $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+ifeq ($(CONTAINER_ENGINE),)
+$(error ERROR: container engine not found. Ensure podman or docker are installed and run make again)
+endif
+
+REGISTRY_USER         ?= $(QUAY_USER)
+REGISTRY_TOKEN        ?= $(QUAY_TOKEN)
+
+# Add --authfile flag if REGISTRY_AUTH_FILE is set
+ifdef REGISTRY_AUTH_FILE
+AUTHFILE_FLAG         := --authfile=$(REGISTRY_AUTH_FILE)
+else
+AUTHFILE_FLAG         :=
+endif
+
+IMAGE_REGISTRY        ?= quay.io
+IMAGE_REPOSITORY      ?= app-sre
+IMAGE_NAME            ?= $(PROJECT_NAME)
+IMAGE_URI             := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY)
+TAG                   ?= latest
+GIT_REVISION_FULL     := $(shell git rev-parse HEAD)
+GIT_REVISION          := $(shell git rev-parse --short=7 HEAD)
+
+BUILD_ARGS            ?=
+CACHE                 ?= --no-cache
+
+# Overrides the base image labels, and adds additional metadata
+PROJECT_LABELS := \
+	--label "version=$(GIT_REVISION)" \
+	--label "distribution-scope=public" \
+	--label "build-date=$(shell date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+	--label "vcs-type=git" \
+	--label "vcs-ref=$(GIT_REVISION_FULL)" \
+	--label "release=$(GIT_REVISION)" \
+	--label "com.redhat.component=$(PROJECT_NAME)" \
+	--label "io.openshift.tags=openshift,ocm-cli,tools" \
+
+# Current podman builds fail with whitespace in labels - will be supported in a near future version
+#--label summary=\'$(PROJECT_SUMMARY)\'
+#--label io.k8s.description=\'$(PROJECT_SUMMARY)\'
+#--label io.openshift.managed.description=\'$(PROJECT_SUMMARY)\'
+
+ifdef GITHUB_TOKEN
+GITHUB_BUILD_ARGS     := --secret=id=GITHUB_TOKEN,env=GITHUB_TOKEN
+endif
+
+# Architecture detection
+RAW_ARCHITECTURE ?= $(shell arch)
+ARCHITECTURE     := $(patsubst aarch64,arm64,$(patsubst x86_64,amd64,$(RAW_ARCHITECTURE)))
+
+# Golang build settings
+unexport GOFLAGS
+GOOS     ?= linux
+GOARCH   ?= $(ARCHITECTURE)
+GOENV     = GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 GOFLAGS=
+GOPATH   := $(shell go env GOPATH)
+HOME     ?= $(shell mktemp -d)
+TESTOPTS ?=
+
+export GO111MODULE = on
+export GOPROXY     = https://proxy.golang.org
+export CGO_ENABLED = 0
+
+# Tool configs
+GORELEASER_VERSION         := v2.43.0
+GORELEASER_CONFIG          := .goreleaser.yaml
+GORELEASER_CORES           := 4
+GORELEASER_ADDITIONAL_ARGS ?=
+
+include boilerplate/generated-includes.mk
+
+# Default target is to build the full container image and tag it
+# as `ocm-container:latest` for local use.  The default target is
+# intended for human use, outside of the CI/CD pipeline.
+default: build tag
+
+.Phony: check
+check:
+	@echo "Checking environment configuration..."
+	@$(MAKE) check-env
+	@echo "Checking GitHub API quota..."
+	@$(MAKE) check-github-quota
+
+# Helper to display environment configuration
+.PHONY: check-env
+check-env:
+	@echo "==================================="
+	@echo " OCM Container Makefile Environment"
+	@echo "==================================="
+	@echo
+	@echo "Project Configuration:"
+	@printf "  %-20s %s\n" "Project Name:" "$(PROJECT_NAME)"
+	@printf "  %-20s %s\n" "Container Engine:" "$(CONTAINER_ENGINE)"
+	@printf "  %-20s %s\n" "Git Revision:" "$(GIT_REVISION)"
+	@echo
+	@echo "Registry & Image Settings:"
+	@printf "  %-20s %s\n" "Registry:" "$(IMAGE_REGISTRY)"
+	@printf "  %-20s %s\n" "Repository:" "$(IMAGE_REPOSITORY)"
+	@printf "  %-20s %s\n" "Image Name:" "$(IMAGE_NAME)"
+	@printf "  %-20s %s\n" "Image URI:" "$(IMAGE_URI)"
+	@printf "  %-20s %s\n" "Tag:" "$(TAG)"
+ifdef REGISTRY_AUTH_FILE
+	@printf "  %-20s %s\n" "Registry Auth File:" "$(REGISTRY_AUTH_FILE)"
+else
+	@printf "  %-20s %s\n" "Registry Auth File:" "UNSET"
+endif
+ifdef REGISTRY_USER
+	@printf "  %-20s %s\n" "Registry User:" "$(REGISTRY_USER)"
+else
+	@printf "  %-20s %s\n" "Registry User:" "UNSET"
+endif
+ifdef REGISTRY_TOKEN
+	@printf "  %-20s %s\n" "Registry Token:" "SET (hidden)"
+else
+	@printf "  %-20s %s\n" "Registry Token:" "UNSET"
+endif
+	@echo
+	@echo "Build Configuration:"
+	@printf "  %-20s %s\n" "Architecture:" "$(ARCHITECTURE) (raw: $(RAW_ARCHITECTURE))"
+	@printf "  %-20s %s\n" "Build Args:" "$(BUILD_ARGS)"
+	@printf "  %-20s %s\n" "Cache:" "$(CACHE)"
+	@printf "  %-20s %s\n" "Labels:" "$(PROJECT_LABELS)"
+ifdef GITHUB_TOKEN
+	@printf "  %-20s %s\n" "GitHub Token:" "SET (hidden)"
+ifdef GITHUB_BUILD_ARGS
+	@printf "  %-20s %s\n" "GitHub Build Args:" "SET (hidden)"
+else
+	@printf "  %-20s %s\n" "GitHub Build Args:" "UNSET"
+endif
+else
+	@printf "  %-20s %s\n" "GitHub Token:" "UNSET"
+	@printf "  %-20s %s\n" "GitHub Build Args:" "UNSET"
+endif
+	@echo
+	@echo "Go Environment:"
+	@printf "  %-20s %s\n" "Go Binary:" "$(GO_BIN)"
+	@printf "  %-20s %s\n" "GOOS:" "$(GOOS)"
+	@printf "  %-20s %s\n" "GOARCH:" "$(GOARCH)"
+	@printf "  %-20s %s\n" "GOPATH:" "$(GOPATH)"
+	@printf "  %-20s %s\n" "GO111MODULE:" "$(GO111MODULE)"
+	@printf "  %-20s %s\n" "GOPROXY:" "$(GOPROXY)"
+	@printf "  %-20s %s\n" "CGO_ENABLED:" "$(CGO_ENABLED)"
+	@printf "  %-20s %s\n" "Test Options:" "$(TESTOPTS)"
+	@echo
+	@echo "Tool Versions:"
+	@printf "  %-20s %s\n" "goreleaser:" "$(GORELEASER_VERSION)"
+	@printf "  %-20s %s\n" "goreleaser config:" "$(GORELEASER_CONFIG)"
+	@printf "  %-20s %s\n" "goreleaser cores:" "$(GORELEASER_CORES)"
+	@printf "  %-20s %s\n" "goreleaser args:" "$(GORELEASER_ADDITIONAL_ARGS)"
+
+# Helper to check GitHub quota for GITHUB_TOKEN
+.PHONY: check-github-quota
+check-github-quota:
+ifndef GITHUB_TOKEN
+	$(error GITHUB_TOKEN is not set)
+endif
+
+	@echo "Checking GitHub API quota..."
+	@curl -s -H "Authorization: token $(GITHUB_TOKEN)" https://api.github.com/rate_limit | jq '.rate'
+
+
+# Helper macro: $(call push_manifest,<image name>)
+# Pushes the manifest for the specified image name
+define push_manifest
+	@echo "Pushing manifest for image: $(IMAGE_URI)/$(1):latest"
+	@if ! ${CONTAINER_ENGINE} manifest exists $(IMAGE_URI)/$(1):latest; then \
+		echo "ERROR: Manifest for $(IMAGE_URI)/$(1):latest does not exist"; \
+		exit 1; \
+	fi
+	${CONTAINER_ENGINE} manifest push $(AUTHFILE_FLAG) $(IMAGE_URI)/$(1):latest
+endef
+
+# Helper macro: $(call build_manifest_target,<image name>,<tag>)
+define build_manifest_target
+    ${CONTAINER_ENGINE} manifest create $(IMAGE_URI)/$(1):$(2)
+	${CONTAINER_ENGINE} manifest add $(IMAGE_URI)/$(1):$(2) containers-storage:$(IMAGE_URI)/$(1):latest-arm64
+	${CONTAINER_ENGINE} manifest add $(IMAGE_URI)/$(1):$(2) containers-storage:$(IMAGE_URI)/$(1):latest-amd64
+endef
+
+# Helper macro: $(call remove_manifest,<image name>
+# Removes the manifest for the specified image name
+# The `|| true` ensures that if the manifest does not exist, the command does not fail
+define remove_manifest
+	@echo "Removing manifest for image: $(IMAGE_URI)/$(1):latest"
+	${CONTAINER_ENGINE} manifest exists $(IMAGE_URI)/$(1):latest && ${CONTAINER_ENGINE} manifest rm $(IMAGE_URI)/$(1):latest || true
+endef
+
+# Helper macro: $(call build_target,<image name>,<architecture>)
+# Builds the container image for the specified target and architecture
+define build_target
+	@echo "Building image: $(1) for architecture: $(2) with manifest $(IMAGE_URI)/$(1):latest"
+	$(eval BUILD_FLAGS := --target=$(1) --platform=$(2) $(CACHE) $(BUILD_ARGS))
+	$(eval BUILD_FLAGS += $(if $(GITHUB_BUILD_ARGS),$(GITHUB_BUILD_ARGS)))
+	$(eval BUILD_FLAGS += -f Containerfile)
+	$(eval PROJECT_LABELS += --label "architecture=$(2)")
+	$(eval PROJECT_LABELS += --label "name=$(1)")
+	$(eval PROJECT_LABELS += --label "io.k8s.display-name=$(1)")
+	$(eval PROJECT_LABELS += --label "io.openshift.managed.name=$(1)")
+	$(eval BUILD_FLAGS += $(PROJECT_LABELS))
+	$(CONTAINER_ENGINE) build $(AUTHFILE_FLAG) --jobs=2 --manifest=$(IMAGE_URI)/$(1):latest $(BUILD_FLAGS) -t $(1):$(2) .
+endef
+
+# Helper macro: $(call build_local_target,<image name>,<architecture>)
+# Builds the container image for local use without manifest
+# We also force the platform to linux/[arch] because the ubi containers don't have darwin targets
+define build_local_target
+	@echo "Building local image: $(1) for architecture: $(2) (without manifest)"
+	$(eval BUILD_FLAGS := --target=$(1) --platform=linux/$(2) $(CACHE) $(BUILD_ARGS))
+	$(eval BUILD_FLAGS += $(if $(GITHUB_BUILD_ARGS),$(GITHUB_BUILD_ARGS)))
+	$(eval BUILD_FLAGS += -f Containerfile)
+	$(eval PROJECT_LABELS += --label "architecture=$(2)")
+	$(eval PROJECT_LABELS += --label "name=$(1)")
+	$(eval PROJECT_LABELS += --label "io.k8s.display-name=$(1)")
+	$(eval PROJECT_LABELS += --label "io.openshift.managed.name=$(1)")
+	$(eval BUILD_FLAGS += $(PROJECT_LABELS))
+	$(CONTAINER_ENGINE) build $(AUTHFILE_FLAG) $(BUILD_FLAGS) -t $(1):$(2) .
+endef
+
+# Helper macro: $(call tag_target,<image name>, <build id>)
+define tag_target
+	${CONTAINER_ENGINE} tag $(1):$(ARCHITECTURE) $(IMAGE_URI)/$(1):$(2)-$(GIT_REVISION)-$(ARCHITECTURE)
+	${CONTAINER_ENGINE} tag $(1):$(ARCHITECTURE) $(IMAGE_URI)/$(1):$(2)-$(ARCHITECTURE)
+	${CONTAINER_ENGINE} tag $(1):$(ARCHITECTURE) $(IMAGE_URI)/$(1):latest-$(ARCHITECTURE)
+endef
+
+# Helper macro: $(call tag_local_target,<image name>,<build id>)
+define tag_local_target
+	${CONTAINER_ENGINE} tag $(1):$(ARCHITECTURE) $(1):latest
+endef
+
+# Helper macro: $(call push_target,<image name>,<build id>)
+define push_target
+	${CONTAINER_ENGINE} push $(AUTHFILE_FLAG) $(IMAGE_URI)/$(1):$(2)-$(GIT_REVISION)-$(ARCHITECTURE)
+	${CONTAINER_ENGINE} push $(AUTHFILE_FLAG) $(IMAGE_URI)/$(1):$(2)-$(ARCHITECTURE)
+	${CONTAINER_ENGINE} push $(AUTHFILE_FLAG) $(IMAGE_URI)/$(1):latest-$(ARCHITECTURE)
+endef
+
+# Helper macro: $(call get_build_id,<image name>,<architecture>)
+# The build ID is the short hash of the image, which is used for tagging
+# This retrieves the build ID of a specific image and architecture
+define get_build_id
+	$(shell ${CONTAINER_ENGINE} image inspect $(1):$(2) | jq -r '.[].Id' | cut -c 1-12)
+endef
+
+# Build targets
+.PHONY: build-all build-micro build-minimal build-full build-full-local build
+build-all: build-micro build-minimal build-full
+
+build-micro: check
+	@$(call build_target,$(IMAGE_NAME)-micro,$(ARCHITECTURE))
+
+build-minimal: check
+	@$(call build_target,$(IMAGE_NAME)-minimal,$(ARCHITECTURE))
+
+build-full: check
+	@$(call build_target,$(IMAGE_NAME),$(ARCHITECTURE))
+
+build-full-local: check
+	@$(call build_local_target,$(IMAGE_NAME),$(ARCHITECTURE))
+
+# The default build target is for human use, outside of the CI/CD pipeline
+build: build-full-local
+
+.PHONY: build-image-amd64
+build-image-amd64: ARCHITECTURE=amd64
+build-image-amd64: build-all
+
+.PHONY: build-image-arm64
+build-image-arm64: ARCHITECTURE=arm64
+build-image-arm64: build-all
+
+# Tagging targets
+.PHONY: tag-all tag-micro tag-minimal tag-full tag-full-local tag
+tag-all: tag-micro tag-minimal tag-full
+
+tag-micro:
+	$(eval BUILD_ID := $(call get_build_id,$(IMAGE_NAME)-micro,$(ARCHITECTURE)))
+	$(call tag_target,$(IMAGE_NAME)-micro,$(BUILD_ID))
+
+tag-minimal:
+	$(eval BUILD_ID := $(call get_build_id,$(IMAGE_NAME)-minimal,$(ARCHITECTURE)))
+	$(call tag_target,$(IMAGE_NAME)-minimal,$(BUILD_ID))
+
+tag-full:
+	$(eval BUILD_ID := $(call get_build_id,$(IMAGE_NAME),$(ARCHITECTURE)))
+	$(call tag_target,$(IMAGE_NAME),$(BUILD_ID))
+
+# "tag-full-local" is the default full target,  to ensure "ocm-container:latest" exists on the local system
+# Intended for humans running manually, outside of the CI/CD pipeline
+# This is called when running the default `make` or `make build` commands
+tag-full-local:
+	$(eval BUILD_ID := $(call get_build_id,$(IMAGE_NAME),$(ARCHITECTURE)))
+	$(call tag_local_target,$(IMAGE_NAME),$(BUILD_ID))
+
+tag: tag-full-local
+
+# Push targets
+.PHONY: push-all push-micro push-minimal push-full push
+push-all: push-micro push-minimal push-full
+
+push-micro:
+	$(eval BUILD_ID := $(call get_build_id,$(IMAGE_NAME)-micro,$(ARCHITECTURE)))
+	$(call push_target,$(IMAGE_NAME)-micro,$(BUILD_ID))
+
+push-minimal:
+	$(eval BUILD_ID := $(call get_build_id,$(IMAGE_NAME)-minimal,$(ARCHITECTURE)))
+	$(call push_target,$(IMAGE_NAME)-minimal,$(BUILD_ID))
+
+push-full:
+	$(eval BUILD_ID := $(call get_build_id,$(IMAGE_NAME),$(ARCHITECTURE)))
+	$(call push_target,$(IMAGE_NAME),$(BUILD_ID))
+
+push: push-full
+
+.PHONY: registry-login
+registry-login:
+ifdef REGISTRY_AUTH_FILE
+	@${CONTAINER_ENGINE} login --authfile=$(REGISTRY_AUTH_FILE) "$(IMAGE_REGISTRY)"
+else
+	@test "${REGISTRY_USER}" != "" && test "${REGISTRY_TOKEN}" != "" || (echo "REGISTRY_USER and REGISTRY_TOKEN must be defined" && exit 1)
+	@${CONTAINER_ENGINE} login -u="${REGISTRY_USER}" -p="${REGISTRY_TOKEN}" "$(IMAGE_REGISTRY)"
+endif
+
+# Removes any existing manifest for the three images
+# This is used to clean up before building a new joint manifest
+.PHONY: remove-manifests
+remove-manifests:
+	$(call remove_manifest,$(IMAGE_NAME)-micro)
+	$(call remove_manifest,$(IMAGE_NAME)-minimal)
+	$(call remove_manifest,$(IMAGE_NAME))
+
+.PHONY: build-latest-manifests
+build-latest-manifests:
+	$(call build_manifest_target,$(IMAGE_NAME)-micro,latest)
+	$(call build_manifest_target,$(IMAGE_NAME)-minimal,latest)
+	$(call build_manifest_target,$(IMAGE_NAME),latest)
+
+.PHONY: push-manifests push-manifest-all push-manifest-micro push-manifest-minimal push-manifest-full
+push-manifest-all:
+	$(call push_manifest,$(IMAGE_NAME)-micro)
+	$(call push_manifest,$(IMAGE_NAME)-minimal)
+	$(call push_manifest,$(IMAGE_NAME))
+
+push-manifest-micro:
+	$(call push_manifest,$(IMAGE_NAME)-micro)
+
+push-manifest-minimal:
+	$(call push_manifest,$(IMAGE_NAME)-minimal)
+
+push-manifest-full:
+	$(call push_manifest,$(IMAGE_NAME))
+
+push-manifests: push-manifest-all
+
+# CI helper targets
+.PHONY: pr-check check-image-build release-image validate-tekton
+pr-check: validate-tekton check-image-build
+
+validate-tekton:
+	@echo "Validating .tekton/ pipeline configuration..."
+	@bash .ci/validate-tekton-pipelines.sh
+
+check-image-build:
+	@echo "Checking image build..."
+	@bash .ci/pull-request-check.sh
+
+release-image:
+	@echo "Running release image build..."
+	@bash .ci/release-build.sh
+
+# Golang-related
+.PHONY: go-build
+go-build: mod fmt lint test build-snapshot
+
+.PHONY: build-binary
+build-binary:
+	$(GOENV) go build -o build/$(PROJECT_NAME) .
+
+.PHONY: mod
+mod:
+	go mod tidy
+
+.PHONY: test
+test:
+	go test ./... -v $(TESTOPTS)
+
+
+.PHONY: release-binary
+release-binary:
+ifndef GITHUB_TOKEN
+	$(error GITHUB_TOKEN is undefined)
+endif
+	goreleaser check --config $(GORELEASER_CONFIG)
+	goreleaser release --draft --clean --config $(GORELEASER_CONFIG) --parallelism $(GORELEASER_CORES) $(GORELEASER_ADDITIONAL_ARGS)
+
+.PHONY: build-snapshot
+build-snapshot:
+	goreleaser build --clean --snapshot --single-target=true --config $(GORELEASER_CONFIG)
+
+.PHONY: fmt
+fmt:
+	gofmt -s -l -w cmd pkg utils
+
+.PHONY: boilerplate-update
+boilerplate-update:
+	@boilerplate/update
+
+.PHONY: clean
+clean:
+	rm -rf \
+		build/*
+		dist/*
