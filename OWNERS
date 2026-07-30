@@ -1,18 +1,18 @@
 reviewers:
-- drewandersonnz
-- iamkirkbater
+- AlexSmithGH
+- chamalabey
 - clcollins
-- rogbas
-- georgettica
+- smarthall
+- tnierman
+- tkong-redhat
+- samanthajayasinghe
 approvers:
-- drewandersonnz
-- iamkirkbater
+- AlexSmithGH
+- chamalabey
 - clcollins
-- rogbas
-- georgettica
+- smarthall
+- tnierman
+- tkong-redhat
+- samanthajayasinghe
 maintainers:
-- drewandersonnz
-- iamkirkbater
 - clcollins
-- rogbas
-- georgettica
